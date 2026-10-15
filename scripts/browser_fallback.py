@@ -5,7 +5,7 @@ Used only when the OpenClaw/shared-browser adapter
 (`~/.openclaw/tools/browser/browser_client.py`) is not installed, so the
 scripts keep working on standalone hosts. It connects to an existing CDP
 endpoint when one is reachable and otherwise launches Playwright's bundled
-Chromium headless with a throwaway temporary profile (no logins, no cookies)
+Chromium (or installed Chrome/Edge) headless with a throwaway temporary profile (no logins, no cookies)
 and connects to that.
 
 Requirements: `pip install playwright && playwright install chromium`.
@@ -14,6 +14,7 @@ Environment:
     COMFY_BROWSER_CDP   CDP endpoint to reuse (default http://127.0.0.1:18800)
     COMFY_BROWSER_PORT  Port for the launched Chromium (default 18800)
     COMFY_BROWSER_MODE  auto (default) | attach (never launch) | launch (always)
+    COMFY_BROWSER_EXE   Optional Chrome/Edge/Chromium executable path
 """
 from __future__ import annotations
 
@@ -24,12 +25,43 @@ import subprocess
 import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
 PORT = int(os.environ.get("COMFY_BROWSER_PORT", "18800"))
 CDP = os.environ.get("COMFY_BROWSER_CDP", f"http://127.0.0.1:{PORT}").rstrip("/")
 MODE = os.environ.get("COMFY_BROWSER_MODE", "auto").strip().lower()
 
 _proc: subprocess.Popen | None = None
+
+
+def _browser_executable(playwright) -> str:
+    """Prefer an explicit executable, then bundled Chromium, then installed browsers."""
+    override = os.environ.get("COMFY_BROWSER_EXE")
+    if override:
+        resolved = shutil.which(override) or override
+        if Path(resolved).is_file():
+            return resolved
+        raise RuntimeError(f"COMFY_BROWSER_EXE does not exist: {override}")
+    bundled = playwright.chromium.executable_path
+    if Path(bundled).is_file():
+        return bundled
+    if os.name == "nt":
+        for root in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(root)
+            if not base:
+                continue
+            for relative in ("Google/Chrome/Application/chrome.exe", "Microsoft/Edge/Application/msedge.exe"):
+                candidate = Path(base) / relative
+                if candidate.is_file():
+                    return str(candidate)
+    for name in ("chromium", "chromium-browser", "google-chrome", "msedge"):
+        candidate = shutil.which(name)
+        if candidate:
+            return candidate
+    raise RuntimeError(
+        "No Chromium browser found. Set COMFY_BROWSER_EXE to Chrome/Edge, "
+        "or run this Python with -m playwright install chromium."
+    )
 
 
 def _cdp_up() -> bool:
@@ -42,7 +74,7 @@ def _cdp_up() -> bool:
 
 def _launch(playwright) -> None:
     global _proc
-    exe = playwright.chromium.executable_path
+    exe = _browser_executable(playwright)
     profile = tempfile.mkdtemp(prefix="comfy-browser-")
     args = [
         exe,
@@ -56,11 +88,24 @@ def _launch(playwright) -> None:
         "--mute-audio",
         f"--user-data-dir={profile}",
     ]
-    _proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _proc = subprocess.Popen(
+            args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+    except OSError as exc:
+        shutil.rmtree(profile, ignore_errors=True)
+        raise RuntimeError(f"Cannot launch browser {exe}: {exc}") from exc
+    proc = _proc
 
     def _cleanup() -> None:
-        if _proc and _proc.poll() is None:
-            _proc.terminate()
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
         shutil.rmtree(profile, ignore_errors=True)
 
     atexit.register(_cleanup)
