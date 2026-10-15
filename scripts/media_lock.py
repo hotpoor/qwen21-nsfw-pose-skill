@@ -17,12 +17,34 @@ Usage:
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import os
+import tempfile
 import time
 from pathlib import Path
 
-LOCK_FILE = Path(os.environ.get("MEDIA_LOCK_FILE", "/tmp/media-task.lock"))
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+            ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD),
+            ("hEvent", wintypes.HANDLE),
+        ]
+
+    _kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_OVERLAPPED)]
+    _kernel.LockFileEx.restype = wintypes.BOOL
+    _kernel.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(_OVERLAPPED)]
+    _kernel.UnlockFileEx.restype = wintypes.BOOL
+else:
+    import fcntl
+
+LOCK_FILE = Path(os.environ.get("MEDIA_LOCK_FILE", str(Path(tempfile.gettempdir()) / "media-task.lock")))
 
 
 class MediaLockError(RuntimeError):
@@ -41,14 +63,25 @@ def media_lock(exclusive: bool, wait_timeout: int = 3600):
     LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
     mode = os.O_RDWR | os.O_CREAT
     f = os.open(LOCK_FILE, mode, 0o644)
+    acquired = False
+    overlapped = _OVERLAPPED() if os.name == "nt" else None
     try:
-        flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         deadline = time.monotonic() + wait_timeout
         while True:
             try:
-                fcntl.flock(f, flags | fcntl.LOCK_NB)
+                if os.name == "nt":
+                    flags = 1 | (2 if exclusive else 0)
+                    if not _kernel.LockFileEx(msvcrt.get_osfhandle(f), flags, 0, 1, 0, ctypes.byref(overlapped)):
+                        error = ctypes.get_last_error()
+                        if error != 33:  # ERROR_LOCK_VIOLATION
+                            raise ctypes.WinError(error)
+                        raise BlockingIOError("media lock busy")
+                else:
+                    flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                    fcntl.flock(f, flags | fcntl.LOCK_NB)
+                acquired = True
                 break
-            except OSError:
+            except (BlockingIOError, PermissionError):
                 if time.monotonic() >= deadline:
                     raise MediaLockError(
                         f"media lock busy (exclusive={exclusive}): another "
@@ -57,8 +90,15 @@ def media_lock(exclusive: bool, wait_timeout: int = 3600):
                 time.sleep(2)
         yield
     finally:
-        fcntl.flock(f, fcntl.LOCK_UN)
-        os.close(f)
+        try:
+            if acquired:
+                if os.name == "nt":
+                    if not _kernel.UnlockFileEx(msvcrt.get_osfhandle(f), 0, 1, 0, ctypes.byref(overlapped)):
+                        raise ctypes.WinError(ctypes.get_last_error())
+                else:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        finally:
+            os.close(f)
 
 
 if __name__ == "__main__":

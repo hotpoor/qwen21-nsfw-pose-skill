@@ -75,8 +75,7 @@ def build_pose_index() -> dict[str, Path]:
     counts: dict[str, int] = {}
     if VNCCS_LIB.is_dir():
         for p in sorted(VNCCS_LIB.rglob("*.json")):
-            s = str(p)
-            if "/poses/" not in s and "/local_user_poses/" not in s:
+            if "poses" not in p.parts and "local_user_poses" not in p.parts:
                 continue
             rel = p.relative_to(VNCCS_LIB).parts
             repo, category, name = _slug(rel[0]), _slug(rel[1]), _slug(p.stem)
